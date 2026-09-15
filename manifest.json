@@ -1,0 +1,74 @@
+{
+  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
+  "schemaVersion": 1,
+  "id": "davidjm.cliamp",
+  "name": "Cliamp in the Bar",
+  "version": "1.0.0",
+  "author": "David JM",
+  "license": "MIT",
+  "description": "Cliamp's headless daemon, tamed into an Omarchy bar widget: now-playing, seek, volume, repeat/shuffle/mono, and your list of favourites \u2014 plus a launch button for the full TUI.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Cliamp",
+    "description": "Control the cliamp terminal music player straight from the bar. A pill shows the current track with a small animated visualizer when playing; left-click play/pauses, right-click opens the full panel with a seek bar, volume, repeat/shuffle/mono toggles, your cliamp favourites list, and a button that drops you into the cliamp TUI. State comes from cliamp's own IPC (Unix socket) and its favourites store, so it works with the headless daemon, the interactive TUI, or any other cliamp client.",
+    "category": "Media",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "aliases": [
+      "cliamp"
+    ],
+    "defaults": {
+      "binary": "cliamp",
+      "favPollMs": 2500,
+      "reconnectMs": 2000,
+      "reconnectCapMs": 30000
+    },
+    "schema": [
+      {
+        "key": "binary",
+        "type": "string",
+        "label": "cliamp binary",
+        "defaultValue": "cliamp",
+        "description": "Path or name of the cliamp executable used for all IPC. Change only if you keep cliamp elsewhere on PATH."
+      },
+      {
+        "key": "favPollMs",
+        "type": "integer",
+        "label": "Favourites poll (ms)",
+        "defaultValue": 2500,
+        "min": 500,
+        "max": 30000,
+        "step": 500,
+        "description": "How often the widget re-reads the cliamp favourites store. Favourites also refresh immediately when the daemon (re)connects and via the panel's refresh button."
+      },
+      {
+        "key": "reconnectMs",
+        "type": "integer",
+        "label": "Reconnect interval (ms)",
+        "defaultValue": 2000,
+        "min": 250,
+        "max": 30000,
+        "step": 250,
+        "description": "How long the widget waits before retrying the cliamp socket when the daemon is not running. Grows up to the cap on repeated failures."
+      },
+      {
+        "key": "reconnectCapMs",
+        "type": "integer",
+        "label": "Reconnect cap (ms)",
+        "defaultValue": 30000,
+        "min": 1000,
+        "max": 60000,
+        "step": 1000,
+        "description": "Upper bound for the reconnect backoff."
+      }
+    ]
+  }
+}
