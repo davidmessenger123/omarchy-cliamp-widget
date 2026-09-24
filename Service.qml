@@ -11,8 +11,8 @@ import "Model.js" as Model
 //
 //   * a persistent `cliamp remote events runtime.state runtime.playlist`
 //     process that pushes newline-delimited JSON snapshots as they happen;
-//   * a healthy-poll of the favourites store (~/.config/cliamp/favorites.toml),
-//     re-read whenever cliamp reconnects and on a slow cadence afterwards;
+//   * a healthy read of the favourites store (~/.config/cliamp/favorites.toml)
+//     through the no-follow reader;
 //   * a 1s tick timer that advances a local display position between events,
 //     because cliamp deliberately does not emit events for playback ticks.
 //
@@ -25,6 +25,8 @@ Item {
   // Shared, reactive state the bar widgets bind against.
 
   property var snapshot: Model.blankSnapshot()
+  property var lastGoodSnapshot: Model.blankSnapshot()
+  property bool lastGoodValid: false
   property real displayPosition: 0
   property bool connected: false
   property bool connecting: true
@@ -34,23 +36,33 @@ Item {
   property var favorites: []
   property string favoritesSource: ""
 
-  // Widget-provided settings (merged with manifest defaults upstream).
   property var settings: ({})
+  property var pendingSettings: ({})
+  property bool settingsFlushPending: false
+  property int settingsRevision: 0
+
+  property var commandQueue: []
+  property bool commandRunning: false
+  property string currentCommandKey: ""
+  property int commandGeneration: 0
+  readonly property int maxCommandQueue: 32
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
   }
 
-  readonly property string cliampPath: String(setting("binary", "cliamp") || "cliamp")
-  readonly property string cliampSocket: root.home + "/.config/cliamp/cliamp.sock"
   property string home: Quickshell.env("HOME") || ""
+  readonly property string bridgePath: Model.scriptPath(Qt.resolvedUrl("bounded_process.py"))
+  readonly property string guardPath: Model.scriptPath(Qt.resolvedUrl("process_guard.py"))
+  readonly property string favoritesReaderPath: Model.scriptPath(Qt.resolvedUrl("favorites_reader.py"))
+  readonly property string interpreterPath: "/usr/bin/python3"
 
-  // Apply the widget's effective settings (called on construction and on
-  // every shell.json edit). Cheap: only the reconnect cadence and favourites
-  // poll rate can be tuned at runtime.
-  function applySettings(s) {
-    root.settings = s || {}
+  function flushSettings() {
+    root.settingsFlushPending = false
+    if (root.settingsRevision <= 0) return
+    root.settings = root.pendingSettings
+    root.pendingSettings = ({})
     var want = Model.clampInt(root.setting("reconnectMs", 2000), 250, 30000, 2000)
     var cap = Model.clampInt(root.setting("reconnectCapMs", 30000), 1000, 60000, 30000)
     root.reconnectBase = want
@@ -60,66 +72,210 @@ Item {
     if (!root.connected && root.connecting) reconnectTimer.restart()
   }
 
-  // ------------------------------------------------------------------ stream
-
-  // One persistent process; cliamp re-subscribes to its own retained events,
-  // so the moment the socket is up we receive the current snapshot followed
-  // by deltas. Exit (daemon stopped, socket missing) schedules a reconnect.
-  Process {
-    id: stream
-    command: []
-    stdout: StdioCollector {
-      id: streamOut
-      waitForEnd: false
-      onDataChanged: root.onStreamProgress()
-    }
-    stderr: StdioCollector {
-      id: streamErr
-      waitForEnd: false
-    }
-    onExited: root.onStreamExited(exitCode)
+  function applySettings(s) {
+    root.pendingSettings = Model.boundedSettings(s)
+    root.settingsRevision++
+    if (root.settingsFlushPending) return
+    root.settingsFlushPending = true
+    Qt.callLater(root.flushSettings)
   }
 
+  // ------------------------------------------------------------------ stream
+
   property int streamSession: 0
-  property int consumed: 0
+  property int streamStopSession: -1
+  property int streamIgnoreSession: -1
+  property int lastEventSeq: -1
+  property int lastEventRevision: -1
+  property int healthSession: 0
+  property int healthFailures: 0
+  property int daemonPid: 0
+  property bool daemonStarting: false
+  property bool favoritesLoading: false
+  property int favoritesSession: 0
+  property int guardSession: 0
+  property int daemonSession: 0
+
+  readonly property string cliampPath: Model.safeExecutable(setting("binary", "cliamp")) || "cliamp"
+  readonly property string cliampDir: Model.safeFavoritesPath(home) === ""
+    ? "" : home + "/.config/cliamp"
+  readonly property string cliampSocket: root.cliampDir === ""
+    ? "" : root.cliampDir + "/cliamp.sock"
 
   function startStream() {
+    if (stream.running) return
+    var command = root.cliampCommand(["remote", "events", "runtime.state", "runtime.playlist"])
+    if (command.length === 0 || root.bridgePath === "" || root.interpreterPath === "") {
+      root.offline("cliamp executable is invalid")
+      return
+    }
     root.streamSession++
-    root.consumed = 0
-    root.streamBuffer = ""
-    stream.command = root.cliampCommand(["remote", "events",
-      "runtime.state", "runtime.playlist"])
+    root.streamStopSession = -1
+    root.streamIgnoreSession = -1
+    root.lastEventSeq = -1
+    root.lastEventRevision = -1
+    streamOut.generation = root.streamSession
+    stream.command = [root.interpreterPath, "-I", root.bridgePath, "stream",
+      "--max-line", String(Model.MAX_EVENT_LINE), "--"].concat(command)
     root.connecting = true
     stream.running = true
   }
 
-  // StdioCollector accumulates all output into `text` (waitForEnd false means
-  // it grows live). Consume only the newly-appended bytes and split on
-  // newlines; cliamp's remote-event output is one compact JSON object per line.
-  property string streamBuffer: ""
-
-  function onStreamProgress() {
-    var full = String(streamOut.text || "")
-    var extra = full.length > root.consumed ? full.slice(root.consumed) : ""
-    root.consumed = full.length
-    root.streamBuffer = root.streamBuffer + extra
-    while (true) {
-      var nl = root.streamBuffer.indexOf("\n")
-      if (nl < 0) break
-      var line = root.streamBuffer.slice(0, nl)
-      root.streamBuffer = root.streamBuffer.slice(nl + 1)
-      root.ingestLine(line)
-    }
-  }
-
-  function ingestLine(line) {
-    var snap = Model.parseEventLine(line)
-    if (!snap) return
-    root.online(snap)
+  function ingestLine(line, generation) {
+    if (generation !== root.streamSession) return
+    var event = Model.parseEvent(line)
+    if (!event) return
+    if (event.seq >= 0 && root.lastEventSeq >= 0 && event.seq < root.lastEventSeq) return
+    if (!root.online(event.snapshot, generation)) return
+    if (event.seq >= 0) root.lastEventSeq = event.seq
   }
 
   function onStreamExited(exitCode) {
+    if (root.streamIgnoreSession === root.streamSession) {
+      root.streamIgnoreSession = -1
+      return
+    }
+    if (root.streamStopSession === root.streamSession) {
+      root.streamStopSession = -1
+      streamRestartTimer.restart()
+      return
+    }
     root.offline("cliamp exited (code " + exitCode + ")")
+  }
+
+  Process {
+    id: stream
+    command: []
+    stdout: SplitParser {
+      id: streamOut
+      property int generation: -1
+      onRead: function(line) {
+        root.ingestLine(String(line || "").trim(), streamOut.generation)
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {}
+    }
+    onExited: function(exitCode) { root.onStreamExited(exitCode) }
+  }
+
+  Process {
+    id: healthProc
+    property int generation: -1
+    property int streamSession: -1
+    property int daemonSession: -1
+    property string output: ""
+    property bool overflow: false
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {
+      id: healthOut
+      property int generation: -1
+      onRead: function(data) {
+        if (healthOut.generation !== healthProc.generation || healthProc.overflow) return
+        var chunk = String(data || "")
+        if (healthProc.output.length + chunk.length > 65536) {
+          healthProc.overflow = true
+          healthProc.output = ""
+          healthProc.running = false
+          return
+        }
+        healthProc.output += chunk + "\n"
+      }
+    }
+    stderr: SplitParser {}
+    onExited: function(exitCode) {
+      var generation = healthProc.generation
+      var streamSession = healthProc.streamSession
+      var daemonSession = healthProc.daemonSession
+      if (generation !== root.healthSession ||
+          streamSession !== root.streamSession ||
+          daemonSession !== root.daemonSession) return
+      healthTimeout.stop()
+      var body = String(healthProc.output || "")
+      var valid = false
+      if (exitCode === 0 && !healthProc.overflow && !healthProc.timedOut) {
+        try {
+          var envelope = JSON.parse(body)
+          if (!envelope || envelope.ok !== true || envelope.version !== 2 || envelope.id !== "cliamp")
+            throw new Error("invalid cliamp state")
+          var raw = envelope.snapshot || envelope.data
+          var snap = Model.snapshotFrom(raw)
+          if (snap) {
+            valid = true
+            root.healthFailures = 0
+            root.online(snap, streamSession)
+            if (!stream.running) Qt.callLater(function() { root.startStream() })
+          }
+        } catch (e) {
+          valid = false
+        }
+      }
+      healthProc.output = ""
+      healthProc.overflow = false
+      healthProc.timedOut = false
+      if (valid) return
+      root.healthFailures++
+      if (root.connected && root.healthFailures >= 2) {
+        root.offline("cliamp health check failed")
+      } else if (!root.connected) {
+        root.scheduleReconnect()
+      }
+    }
+  }
+
+  Timer {
+    id: healthTimeout
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!healthProc.running) return
+      healthProc.timedOut = true
+      healthProc.signal(15)
+      healthProc.running = false
+      healthProc.generation = -1
+      healthSession++
+      healthTimeout.stop()
+      if (root.connected) root.offline("cliamp health check timed out")
+      else root.scheduleReconnect()
+    }
+  }
+
+  function startHealthProbe() {
+    if (healthProc.running || (!root.connected && !root.connecting)) return
+    var command = root.cliampCommand(["remote", "state"])
+    if (command.length === 0 || root.bridgePath === "" || root.interpreterPath === "") return
+    var streamSession = root.streamSession
+    var daemonSession = root.daemonSession
+    root.healthSession++
+    healthProc.generation = root.healthSession
+    healthProc.streamSession = streamSession
+    healthProc.daemonSession = daemonSession
+    healthOut.generation = root.healthSession
+    healthProc.output = ""
+    healthProc.overflow = false
+    healthProc.timedOut = false
+    healthProc.command = [root.interpreterPath, "-I", root.bridgePath, "run",
+      "--max-output", "65536", "--timeout", "4", "--"].concat(command)
+    healthProc.running = true
+    healthTimeout.restart()
+  }
+
+  Timer {
+    id: healthTimer
+    interval: 5000
+    repeat: true
+    running: root.connected || root.connecting
+    onTriggered: root.startHealthProbe()
+  }
+
+  Timer {
+    id: streamRestartTimer
+    interval: 100
+    repeat: false
+    onTriggered: {
+      if (!stream.running) root.startStream()
+    }
   }
 
   Timer {
@@ -141,20 +297,28 @@ Item {
     reconnectTimer.restart()
   }
 
-  // -- lifecycle of the shared snapshot -------------------------------
-
-  function online(snap) {
+  function online(snap, sourceSession) {
+    if (sourceSession !== root.streamSession) return false
+    if (!Model.shouldApplySnapshot(snap, root.lastEventRevision, root.streamSession, sourceSession)) return false
+    if (!snap.track) return false
     var wasConnected = root.connected
+    if (snap.revision >= 0) root.lastEventRevision = snap.revision
+    root.lastGoodSnapshot = snap
+    root.lastGoodValid = true
     root.snapshot = snap
     root.displayPosition = snap.position
     root.connected = true
     root.connecting = false
     root.failCount = 0
+    root.healthFailures = 0
     root.lastError = ""
-    if (!wasConnected) root.reconnectTry = 0
-    // Favourites may have changed while we were away; refresh once on the
-    // connect transition (the poll timer keeps them current afterwards).
-    if (!wasConnected) root.refreshFavorites()
+    root.daemonStarting = false
+    daemonStartTimer.stop()
+    if (!wasConnected) {
+      root.reconnectTry = 0
+      root.refreshFavorites()
+    }
+    return true
   }
 
   function offline(reason) {
@@ -162,66 +326,344 @@ Item {
     root.connecting = false
     root.lastError = String(reason || "cliamp is not running")
     root.failCount++
-    root.snapshot = Model.blankSnapshot()
-    root.displayPosition = 0
+    root.displayPosition = root.lastGoodValid ? root.lastGoodSnapshot.position : 0
+    root.healthSession++
+    root.favoritesSession++
+    root.favoritesLoading = false
+    favoritesProc.running = false
+    favoritesTimeout.stop()
+    root.streamIgnoreSession = root.streamSession
+    stream.running = false
+    healthProc.running = false
+    healthTimeout.stop()
+    root.commandGeneration++
+    commandTimeout.stop()
+    commandProc.running = false
+    root.commandQueue = []
+    root.commandRunning = false
+    root.currentCommandKey = ""
     root.scheduleReconnect()
+  }
+
+  function boundedRunCommand(args, maximum) {
+    var command = root.cliampCommand(args)
+    if (command.length === 0 || root.bridgePath === "" || root.interpreterPath === "") return []
+    return [root.interpreterPath, "-I", root.bridgePath, "run",
+      "--max-output", String(maximum), "--timeout", "8", "--"].concat(command)
+  }
+
+  function guardCommand(action) {
+    if (root.guardPath === "" || root.interpreterPath === "" || root.cliampDir === "") return []
+    return [root.interpreterPath, "-I", root.guardPath, action,
+      root.cliampDir + "/cliamp.sock.pid", root.cliampPath]
+  }
+
+  function launchDaemon() {
+    if (root.daemonStarting || daemonProc.running) return
+    var command = root.boundedRunCommand(["--daemon", "--log-level", "error"], 65536)
+    if (command.length === 0) {
+      root.lastError = "cliamp executable is invalid"
+      return
+    }
+    root.daemonStarting = true
+    daemonProc.generation = ++root.daemonSession
+    daemonProc.timedOut = false
+    daemonProc.command = command
+    daemonProc.running = true
+    daemonStartTimer.restart()
+  }
+
+  function startDaemon() {
+    if (root.daemonStarting || daemonProc.running || guardProc.running) return
+    guardProc.action = "check"
+    guardProc.generation = ++root.guardSession
+    guardProc.command = root.guardCommand("check")
+    if (guardProc.command.length === 0) {
+      root.lastError = "cliamp daemon identity is unavailable"
+      return
+    }
+    guardTimeout.restart()
+    guardProc.running = true
+  }
+
+  function stopDaemon() {
+    if (guardProc.running || daemonProc.running) return
+    guardProc.action = "stop"
+    guardProc.generation = ++root.guardSession
+    guardProc.command = root.guardCommand("stop")
+    if (guardProc.command.length === 0) {
+      root.lastError = "cliamp daemon identity is unavailable"
+      return
+    }
+    guardProc.timedOut = false
+    guardTimeout.restart()
+    guardProc.running = true
+  }
+
+  Process {
+    id: guardProc
+    property int generation: -1
+    property string action: ""
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {}
+    stderr: SplitParser {}
+    onExited: function(exitCode) {
+      if (guardProc.generation !== root.guardSession) return
+      guardTimeout.stop()
+      if (guardProc.action === "check") {
+        if (exitCode === 0 && !guardProc.timedOut) {
+          root.daemonPid = 1
+          root.daemonStarting = false
+        } else {
+          root.daemonPid = 0
+          root.launchDaemon()
+        }
+        guardProc.timedOut = false
+        return
+      }
+      if (exitCode === 0 && !guardProc.timedOut) {
+        root.daemonPid = 0
+        root.lastError = "cliamp daemon stopped"
+      } else {
+        root.lastError = "cliamp daemon identity check failed"
+      }
+      guardProc.timedOut = false
+    }
+  }
+
+  Timer {
+    id: guardTimeout
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!guardProc.running) return
+      guardProc.timedOut = true
+      guardProc.signal(15)
+      guardProc.running = false
+      guardProc.generation = -1
+      root.daemonPid = 0
+      root.daemonStarting = false
+      root.lastError = "cliamp daemon identity check failed"
+    }
+  }
+
+  Process {
+    id: daemonProc
+    property int generation: -1
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {}
+    stderr: SplitParser {}
+    onExited: function(exitCode) {
+      if (daemonProc.generation !== root.daemonSession) return
+      daemonStartTimer.stop()
+      root.daemonStarting = false
+      if (exitCode !== 0 || daemonProc.timedOut) {
+        if (!root.connected) root.lastError = "cliamp daemon did not start"
+      } else {
+        root.daemonPid = 1
+      }
+    }
+  }
+
+  Timer {
+    id: daemonStartTimer
+    interval: 8000
+    repeat: false
+    onTriggered: {
+      if (daemonProc.running) {
+        daemonProc.timedOut = true
+        daemonProc.signal(15)
+        daemonProc.running = false
+        daemonProc.generation = -1
+        daemonSession++
+      }
+      root.daemonStarting = false
+      if (!root.connected) root.lastError = "cliamp daemon did not start"
+    }
   }
 
   // ------------------------------------------------------------- favourites
 
   // cliamp stores favourites in a small TOML file and exposes no IPC query
-  // for them, so we read the store directly. It is tiny; a low-frequency poll
-  // plus an explicit refresh from the panel's button is plenty.
+  // for them, so the no-follow reader performs each bounded reload.
   Process {
-    id: favProc
+    id: favoritesProc
+    property int generation: -1
+    property bool timedOut: false
+    property bool exited: false
+    property int exitCode: -1
     command: []
     stdout: StdioCollector {
-      id: favOut
       waitForEnd: true
+      onStreamFinished: {
+        var body = text
+        var generation = favoritesProc.generation
+        Qt.callLater(function() {
+          if (favoritesProc.generation !== generation || generation !== root.favoritesSession) return
+          if (!favoritesProc.exited || favoritesProc.exitCode !== 0 || favoritesProc.timedOut) return
+          root.favoritesLoading = false
+          favoritesTimeout.stop()
+          root.ingestFavorites(body)
+        })
+      }
     }
-    stderr: StdioCollector {
-      id: favErr
-      waitForEnd: true
-    }
+    stderr: SplitParser {}
     onExited: function(exitCode) {
-      root.favBusy = false
-      if (exitCode !== 0) return
-      var text = String(favOut.text || "")
-      if (text === root.favoritesSource) return
-      root.favoritesSource = text
-      root.favorites = Model.parseFavoritesToml(text)
+      if (favoritesProc.generation !== root.favoritesSession) return
+      favoritesTimeout.stop()
+      favoritesProc.exited = true
+      favoritesProc.exitCode = exitCode
+      root.favoritesLoading = false
+      favoritesProc.timedOut = false
     }
   }
 
-  property bool favBusy: false
+  Timer {
+    id: favoritesTimeout
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!favoritesProc.running) return
+      favoritesProc.timedOut = true
+      favoritesProc.signal(15)
+      favoritesProc.running = false
+      root.favoritesLoading = false
+      root.favoritesSession++
+    }
+  }
+
+  function ingestFavorites(value) {
+    var body = String(value || "")
+    if (body.length > Model.MAX_FAVORITES_BYTES) return false
+    var parsed = Model.parseFavoritesToml(body)
+    if (parsed === null) return false
+    if (body === root.favoritesSource) return true
+    root.favoritesSource = body
+    root.favorites = parsed
+    return true
+  }
 
   function refreshFavorites() {
-    if (root.favBusy) return
-    root.favBusy = true
-    favProc.command = ["/bin/sh", "-c",
-      "cat \"" + root.home + "/.config/cliamp/favorites.toml\""]
-    favProc.running = true
+    if (!root.connected || root.favoritesLoading || root.favoritesReaderPath === "" || root.bridgePath === "" || root.interpreterPath === "") return
+    var target = Model.safeFavoritesPath(root.home)
+    if (target === "") return
+    var command = [root.interpreterPath, "-I", root.favoritesReaderPath, root.home, target]
+    root.favoritesLoading = true
+    root.favoritesSession++
+    favoritesProc.generation = root.favoritesSession
+    favoritesProc.timedOut = false
+    favoritesProc.exited = false
+    favoritesProc.exitCode = -1
+    favoritesProc.command = [root.interpreterPath, "-I", root.bridgePath, "run",
+      "--max-output", String(Model.MAX_FAVORITES_BYTES), "--timeout", "4", "--"].concat(command)
+    favoritesTimeout.restart()
+    favoritesProc.running = true
   }
 
   Timer {
     id: favoritesTimer
     interval: 2500
     repeat: true
-    running: true
-    onTriggered: { if (root.connected) root.refreshFavorites() }
+    running: root.connected
+    onTriggered: root.refreshFavorites()
   }
-
-  // ------------------------------------------------------------------ utils
 
   function cliampCommand(args) {
-    var all = [root.cliampPath]
-    return all.concat(args || [])
+    var executable = Model.safeExecutable(root.cliampPath)
+    if (!executable || !Array.isArray(args) || args.length > 16) return []
+    var values = [executable]
+    for (var i = 0; i < args.length; i++) {
+      var value = String(args[i] === undefined || args[i] === null ? "" : args[i])
+      if (value.length > Model.MAX_EVENT_LINE || /[\x00-\x1f\x7f]/.test(value)) return []
+      values.push(value)
+    }
+    return values
   }
 
-  // Fire-and-forget playback command. Commands are short and go straight to
-  // the unix socket; no shell is involved.
   function run(args) {
-    Quickshell.execDetached(root.cliampCommand(args))
+    if (!Array.isArray(args) || args.length > 16) return
+    var safeArgs = []
+    for (var i = 0; i < args.length; i++) {
+      var value = String(args[i] === undefined || args[i] === null ? "" : args[i])
+      if (value.length > Model.MAX_EVENT_LINE || /[\x00-\x1f\x7f]/.test(value)) return
+      safeArgs.push(value)
+    }
+    var key = Model.commandKey(safeArgs)
+    if (!key || root.currentCommandKey === key) return
+    var pending = root.commandQueue.slice(0)
+    for (var j = 0; j < pending.length; j++) if (pending[j].key === key) return
+    if (pending.length >= root.maxCommandQueue) {
+      root.lastError = "cliamp command queue is full"
+      return
+    }
+    pending.push({ "key": key, "args": safeArgs })
+    root.commandQueue = pending
+    root.commandNext()
+  }
+
+  function commandNext() {
+    if (root.commandRunning || root.commandQueue.length === 0) return
+    var pending = root.commandQueue.slice(0)
+    var job = pending.shift()
+    root.commandQueue = pending
+    var command = root.boundedRunCommand(job.args, 65536)
+    if (command.length === 0) {
+      root.lastError = "cliamp executable is invalid"
+      root.commandNext()
+      return
+    }
+    root.commandRunning = true
+    root.currentCommandKey = job.key
+    commandProc.generation = ++root.commandGeneration
+    commandProc.timedOut = false
+    commandProc.command = command
+    commandTimeout.restart()
+    commandProc.running = true
+  }
+
+  Process {
+    id: commandProc
+    property int generation: -1
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {}
+    stderr: SplitParser {}
+    onExited: function(exitCode) {
+      if (commandProc.generation !== root.commandGeneration) return
+      commandTimeout.stop()
+      commandProc.running = false
+      commandProc.timedOut = false
+      root.commandRunning = false
+      root.currentCommandKey = ""
+      root.commandNext()
+    }
+  }
+
+  Timer {
+    id: commandTimeout
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (!commandProc.running) return
+      commandProc.timedOut = true
+      commandProc.signal(15)
+      commandProc.running = false
+      commandProc.generation = -1
+      commandTimeout.stop()
+      root.commandRunning = false
+      root.currentCommandKey = ""
+      root.lastError = "cliamp command timed out"
+      root.commandNext()
+    }
+  }
+
+  function openTerminal() {
+    var command = root.cliampCommand([])
+    if (command.length === 0 || root.bridgePath === "" || root.interpreterPath === "") return
+    Quickshell.execDetached([root.interpreterPath, "-I", root.bridgePath,
+      "terminal", "--"].concat(command))
   }
 
   // ------------------------------------------------------------------ timer
@@ -229,32 +671,60 @@ Item {
   // Advance the displayed position every second while playing. Events carry
   // exact positions but never arrive for playback ticks, so this keeps the
   // pill and seek bar smooth without spamming the daemon.
+  readonly property bool playing: Model.playing(root.snapshot)
+
   Timer {
     id: tickTimer
     interval: 1000
     repeat: true
-    running: true
+    running: root.connected && root.playing
     onTriggered: {
-      if (!root.connected) return
       var snap = root.snapshot
-      if (Model.playing(snap)) {
-        var next = root.displayPosition + snap.speed
-        if (Model.isStream(snap) || !snap.seekable || snap.duration <= 0) {
-          root.displayPosition = next
-        } else if (next < snap.duration) {
-          root.displayPosition = next
-        } else if (snap.repeat === "One") {
-          root.displayPosition = 0
-        } else {
-          // Rolled past the end; next event will correct the position.
-          root.displayPosition = snap.duration
-        }
+      var next = root.displayPosition + snap.speed
+      if (Model.isStream(snap) || !snap.seekable || snap.duration <= 0) {
+        root.displayPosition = next
+      } else if (next < snap.duration) {
+        root.displayPosition = next
+      } else if (snap.repeat === "One") {
+        root.displayPosition = 0
+      } else {
+        // Rolled past the end; next event will correct the position.
+        root.displayPosition = snap.duration
       }
     }
   }
 
   // Timers touching the position only make sense while anything is playing;
   // the same connect path that arms the stream also re-onlines position.
+  Component.onDestruction: {
+    root.settingsFlushPending = false
+    root.streamSession++
+    root.streamIgnoreSession = root.streamSession
+    root.healthSession++
+    root.favoritesSession++
+    root.guardSession++
+    root.daemonSession++
+    root.commandGeneration++
+    root.commandQueue = []
+    root.commandRunning = false
+    root.currentCommandKey = ""
+    stream.running = false
+    healthProc.running = false
+    favoritesProc.running = false
+    daemonProc.running = false
+    guardProc.running = false
+    commandProc.running = false
+    reconnectTimer.stop()
+    healthTimeout.stop()
+    favoritesTimeout.stop()
+    guardTimeout.stop()
+    daemonStartTimer.stop()
+    commandTimeout.stop()
+    healthTimer.stop()
+    favoritesTimer.stop()
+    streamRestartTimer.stop()
+  }
+
   Component.onCompleted: {
     root.reconnectTry = 0
     root.startStream()

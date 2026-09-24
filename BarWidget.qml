@@ -20,8 +20,10 @@ BarWidget {
   readonly property var svc: bar && bar.shell
     ? bar.shell.serviceFor(root.moduleName) : null
 
-  readonly property var snap: root.svc && root.svc.connected
-    ? root.svc.snapshot : Model.blankSnapshot()
+  // Cache once — calling blankSnapshot() inside a binding re-allocates on every
+  // disconnect re-evaluation. Service already blanks snapshot when offline.
+  readonly property var emptySnap: Model.blankSnapshot()
+  readonly property var snap: root.svc ? root.svc.snapshot : root.emptySnap
   readonly property bool down: !root.svc || !root.svc.connected
   readonly property bool connecting: root.svc && root.svc.connecting
   readonly property bool playing: Model.playing(root.snap)
@@ -30,7 +32,7 @@ BarWidget {
   readonly property real seekEnd: root.snap.duration > 0 && root.snap.seekable
     ? root.snap.duration : 0
   readonly property real position: root.playing
-    ? Math.min(root.svc.displayPosition, root.seekEnd)
+    ? Math.min(root.svc ? root.svc.displayPosition : 0, root.seekEnd)
     : Math.min(root.snap.position, root.seekEnd)
 
   readonly property color fg: root.bar ? root.bar.barForeground : Color.foreground
@@ -66,21 +68,17 @@ BarWidget {
   function togglePanel() { root.popupOpen = !root.popupOpen }
 
   function startDaemon() {
-    if (!root.svc) return
-    Quickshell.execDetached([root.svc.cliampPath, "--daemon", "--log-level", "error"])
+    if (root.svc) root.svc.startDaemon()
   }
   function stopDaemon() {
-    // The v2 IPC API has no shutdown operation, so stop the daemon process
-    // itself. The bracket trick keeps the pattern from matching its own pkill.
-    Quickshell.execDetached(["pkill", "-TERM", "-f", "[c]liamp --daemon"])
+    if (root.svc) root.svc.stopDaemon()
   }
   function toggleDaemon() {
     if (root.down) root.startDaemon()
     else root.stopDaemon()
   }
   function openTui() {
-    if (!root.svc) return
-    Quickshell.execDetached(["omarchy-launch-terminal", root.svc.cliampPath])
+    if (root.svc) root.svc.openTerminal()
   }
 
   // Keep the service in lockstep with this widget's effective settings.
@@ -346,7 +344,7 @@ BarWidget {
                     opacity: root.playing ? 0.9 : 0.45
 
                     SequentialAnimation on height {
-                      running: root.playing
+                      running: root.playing && root.popupOpen && liveVis.visible
                       loops: Animation.Infinite
                       NumberAnimation { to: liveVis.height * (0.35 + (index % 5) * 0.16); duration: 170 + index * 30; easing.type: Easing.OutQuad }
                       NumberAnimation { to: liveVis.height * (0.16 + (index % 4) * 0.12); duration: 170 + index * 30; easing.type: Easing.InQuad }

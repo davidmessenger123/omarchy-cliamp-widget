@@ -10,15 +10,17 @@ its favourites store.
 
 | Piece | File | Kind |
 |---|---|---|
-| IPC engine (owns the cliamp event stream + favourites poll) | `Service.qml` | `service` |
+| IPC engine (owns the cliamp event stream + bounded favourites watch) | `Service.qml` | `service` |
 | Bar pill + keyboard panel | `BarWidget.qml` | `bar-widget` |
+| Bounded process bridge / pidfd identity guard | `bounded_process.py`, `process_guard.py` | — |
+| No-follow favourites reader | `favorites_reader.py` | — |
 | Pure parsing/format helpers | `Model.js` | — |
 
 The widget is **always visible** (even when the daemon is down, it shows a
 "not running" banner with a one-click *Start daemon* button), so it doubles
-as a cliamp launcher. Favourites are read straight from
-`~/.config/cliamp/favorites.toml`, so anything you favourite in the cliamp
-TUI appears in the widget within a moment.
+as a cliamp launcher. Favourites are read with a bounded, no-shell, no-follow
+file reader, so anything you favourite in the cliamp TUI appears in the widget
+within a moment.
 
 ## Requirements
 
@@ -107,21 +109,22 @@ Set `binary` in the widget settings to point at a non-default cliamp binary.
 ## How the plumbing works
 
 `Service.qml` runs one persistent `cliamp remote events runtime.state
-runtime.playlist` process. cliamp pushes a full snapshot as the first (retained)
-event, then fires deltas whenever state changes — but deliberately **not** on
-position ticks, so the service advances `displayPosition` itself on a 1 s timer
-while `state == playing`. Favourites are not exposed over IPC, so they're read
-directly from `~/.config/cliamp/favorites.toml` (a tiny TOML list of `[[entry]]`
-blocks) on a low-frequency poll plus on connect. When the daemon disappears the
-service backs off exponentially (settings `reconnectMs` → `reconnectCapMs`) and
-marks itself offline.
+runtime.playlist` process through `bounded_process.py`. The bridge reads fixed
+chunks, caps each newline-delimited record before QML sees it, and terminates a
+child that exceeds the cap. A bounded state probe provides a connection
+watchdog when playback is idle. Daemon start/stop uses a pidfd-backed identity
+check (`process_guard.py`) rather than a broad process match or a bare PID
+signal. The last validated snapshot is retained across transient disconnects,
+and playback/settings commands use a bounded, duplicate-suppressing queue.
+Favourites are read by `favorites_reader.py` with no-follow, nonblocking,
+ownership, type, link-count, size, and descriptor-stability checks. When the
+daemon disappears the service backs off exponentially (settings `reconnectMs`
+→ `reconnectCapMs`) and marks itself offline.
 
 Quirks worked around:
 
-- `StdioCollector` with `waitForEnd: false` **accumulates** output into `text`;
-  the service consumes only the newly appended bytes (a `consumed` offset) and
-  splits on newlines.
-- cliamp expects one JSON object per line on the event stream.
+- cliamp expects one JSON object per line on the event stream; the bridge
+  bounds a final unterminated line before flushing it.
 - Favourites toggled in the TUI while the widget is open show up at the next
   poll tick (default 2.5 s).
 
