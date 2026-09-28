@@ -10,9 +10,19 @@ import time
 
 SYSTEM_BINDIRS = ("/usr/local/bin", "/usr/share/omarchy/bin", "/usr/bin", "/bin")
 SYSTEM_PATH = ":".join(SYSTEM_BINDIRS)
+SESSION_ENV_NAMES = (
+    "WAYLAND_DISPLAY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "OMARCHY_PATH",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DISPLAY",
+)
 DEFAULT_MAX_OUTPUT = 1024 * 1024
 DEFAULT_MAX_LINE = 256 * 1024
 READ_SIZE = 65536
+MAX_STDERR_LINE = 4096
+MAX_STDERR_TOTAL = 64 * 1024
 _ACTIVE_PROCESS = None
 
 
@@ -53,7 +63,7 @@ def _trusted_file(path, system=False):
         info = os.stat(resolved)
     except OSError:
         return None
-    allowed_owner = 0 if system else (0, os.geteuid())
+    allowed_owner = (0,) if system else (0, os.geteuid())
     if not stat.S_ISREG(info.st_mode) or info.st_uid not in allowed_owner:
         return None
     if stat.S_IMODE(info.st_mode) & 0o022:
@@ -91,6 +101,40 @@ def _child_environment():
     return env
 
 
+def _session_environment():
+    env = _child_environment()
+    for name in SESSION_ENV_NAMES:
+        value = os.environ.get(name, "")
+        if value and len(value) <= 4096 and "\x00" not in value and "\n" not in value and "\r" not in value:
+            env[name] = value
+    if not env.get("WAYLAND_DISPLAY"):
+        env["WAYLAND_DISPLAY"] = _newest_wayland_socket(env.get("XDG_RUNTIME_DIR", ""))
+    return env
+
+
+def _newest_wayland_socket(runtime_dir):
+    if not runtime_dir or not os.path.isdir(runtime_dir):
+        return ""
+    try:
+        names = os.listdir(runtime_dir)
+    except OSError:
+        return ""
+    best = ""
+    best_mtime = -1.0
+    for name in names:
+        if not name.startswith("wayland-") or name.endswith(".lock"):
+            continue
+        try:
+            info = os.stat(os.path.join(runtime_dir, name))
+        except OSError:
+            continue
+        if not stat.S_ISSOCK(info.st_mode) or info.st_mtime <= best_mtime:
+            continue
+        best = name
+        best_mtime = info.st_mtime
+    return best
+
+
 def _child_command(command):
     if not isinstance(command, (list, tuple)) or not command or len(command) > 32:
         raise ValueError("invalid command")
@@ -114,7 +158,7 @@ def _spawn(command):
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             start_new_session=True,
             close_fds=True,
             env=_child_environment(),
@@ -134,10 +178,48 @@ def _kill_group(process):
             pass
 
 
+def _write_error_line(line):
+    if len(line) > MAX_STDERR_LINE:
+        line = line[:MAX_STDERR_LINE]
+    try:
+        sys.stderr.buffer.write(bytes(line) + b"\n")
+        sys.stderr.buffer.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _flush_stderr(pending, budget):
+    if not pending or budget[0] <= 0:
+        return
+    _write_error_line(bytes(pending))
+    del pending[:]
+
+
+def _forward_stderr(pending, chunk, budget):
+    if budget[0] <= 0:
+        return
+    take = chunk[: budget[0]]
+    budget[0] -= len(take)
+    pending.extend(take)
+    while True:
+        index = pending.find(b"\n")
+        if index < 0:
+            break
+        line = bytes(pending[:index]).rstrip(b"\r")
+        del pending[: index + 1]
+        _write_error_line(line)
+    if len(pending) > MAX_STDERR_LINE:
+        _write_error_line(bytes(pending[:MAX_STDERR_LINE]))
+        del pending[:]
+
+
 def _read_run_output(process, maximum, timeout):
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
     output = bytearray()
+    error_pending = bytearray()
+    error_budget = [MAX_STDERR_TOTAL]
     deadline = time.monotonic() + max(1, min(120, timeout))
     status = 0
     try:
@@ -149,6 +231,14 @@ def _read_run_output(process, maximum, timeout):
                 process.wait()
                 break
             for key, _ in selector.select(min(0.25, remaining)):
+                if key.fileobj is process.stderr:
+                    chunk = os.read(key.fileobj.fileno(), READ_SIZE)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        _flush_stderr(error_pending, error_budget)
+                    else:
+                        _forward_stderr(error_pending, chunk, error_budget)
+                    continue
                 chunk = os.read(key.fileobj.fileno(), min(READ_SIZE, maximum + 1 - len(output)))
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -170,10 +260,12 @@ def _read_run_output(process, maximum, timeout):
             pass
     finally:
         selector.close()
-        try:
-            process.stdout.close()
-        except OSError:
-            pass
+        for pipe in (process.stdout, process.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    _flush_stderr(error_pending, error_budget)
     if status:
         return status, bytes(output[:maximum])
     try:
@@ -215,7 +307,10 @@ def stream_lines(command, maximum):
     _ACTIVE_PROCESS = process
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
     pending = bytearray()
+    error_pending = bytearray()
+    error_budget = [MAX_STDERR_TOTAL]
     deadline = time.monotonic() + 86400
     overflow = False
     eof = False
@@ -226,6 +321,14 @@ def stream_lines(command, maximum):
                 overflow = True
                 break
             for key, _ in selector.select(min(0.25, remaining)):
+                if key.fileobj is process.stderr:
+                    chunk = os.read(key.fileobj.fileno(), READ_SIZE)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        _flush_stderr(error_pending, error_budget)
+                    else:
+                        _forward_stderr(error_pending, chunk, error_budget)
+                    continue
                 chunk = os.read(key.fileobj.fileno(), min(READ_SIZE, maximum + 1 - len(pending)))
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -257,10 +360,12 @@ def stream_lines(command, maximum):
         overflow = True
     finally:
         selector.close()
-        try:
-            process.stdout.close()
-        except OSError:
-            pass
+        for pipe in (process.stdout, process.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    _flush_stderr(error_pending, error_budget)
     if overflow:
         _kill_group(process)
         process.wait()
@@ -289,7 +394,7 @@ def launch_terminal(command):
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
-            env=_child_environment(),
+            env=_session_environment(),
         )
     except OSError as error:
         raise RuntimeError(str(error)) from error

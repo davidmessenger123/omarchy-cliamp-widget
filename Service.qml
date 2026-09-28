@@ -47,6 +47,29 @@ Item {
   property int commandGeneration: 0
   readonly property int maxCommandQueue: 32
 
+  // Child stderr is where cliamp explains itself ("cliamp is not running",
+  // wayland failures, bad IPC replies), and discarding it is how a broken
+  // bridge can look identical to a widget with nothing to say. Repeats are
+  // folded because the health probe re-runs every few seconds.
+  property var stderrLast: ({})
+  property int stderrLogged: 0
+  readonly property int maxStderrLines: 200
+  readonly property int maxStderrLength: 200
+
+  function logStderr(source, line) {
+    var text = String(line === undefined || line === null ? "" : line).trim()
+    if (!text || text.length > 4096) return
+    if (text.length > root.maxStderrLength) text = text.slice(0, root.maxStderrLength) + "..."
+    if (root.stderrLogged >= root.maxStderrLines) return
+    var seen = {}
+    for (var key in root.stderrLast) seen[key] = root.stderrLast[key]
+    if (seen[source] === text) return
+    seen[source] = text
+    root.stderrLast = seen
+    root.stderrLogged++
+    console.warn("cliamp " + source + ": " + text)
+  }
+
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -154,7 +177,7 @@ Item {
       }
     }
     stderr: SplitParser {
-      onRead: function(line) {}
+      onRead: function(line) { root.logStderr("stream", line) }
     }
     onExited: function(exitCode) { root.onStreamExited(exitCode) }
   }
@@ -183,7 +206,9 @@ Item {
         healthProc.output += chunk + "\n"
       }
     }
-    stderr: SplitParser {}
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("health", line) }
+    }
     onExited: function(exitCode) {
       var generation = healthProc.generation
       var streamSession = healthProc.streamSession
@@ -407,7 +432,9 @@ Item {
     property bool timedOut: false
     command: []
     stdout: SplitParser {}
-    stderr: SplitParser {}
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("guard", line) }
+    }
     onExited: function(exitCode) {
       if (guardProc.generation !== root.guardSession) return
       guardTimeout.stop()
@@ -454,7 +481,9 @@ Item {
     property bool timedOut: false
     command: []
     stdout: SplitParser {}
-    stderr: SplitParser {}
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("daemon", line) }
+    }
     onExited: function(exitCode) {
       if (daemonProc.generation !== root.daemonSession) return
       daemonStartTimer.stop()
@@ -509,7 +538,9 @@ Item {
         })
       }
     }
-    stderr: SplitParser {}
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("favorites", line) }
+    }
     onExited: function(exitCode) {
       if (favoritesProc.generation !== root.favoritesSession) return
       favoritesTimeout.stop()
@@ -629,7 +660,9 @@ Item {
     property bool timedOut: false
     command: []
     stdout: SplitParser {}
-    stderr: SplitParser {}
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("command", line) }
+    }
     onExited: function(exitCode) {
       if (commandProc.generation !== root.commandGeneration) return
       commandTimeout.stop()

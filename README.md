@@ -40,26 +40,34 @@ Set `binary` in the widget settings to point at a non-default cliamp binary.
      ~/.config/omarchy/plugins/davidjm.cliamp
    ```
 
-2. Make sure the plugin is enabled and the widget is in a bar section of
-   `~/.config/omarchy/shell.json`, e.g.:
+2. Make sure the widget is in a bar section of `~/.config/omarchy/shell.json`,
+   e.g.:
 
    ```jsonc
    {
      "bar": {
-       "sections": { "right": [
+       "layout": { "right": [
          "omarchy.tray",
          { "id": "davidjm.cliamp" }
        ] }
-     },
-     "plugins": [
-       { "id": "davidjm.cliamp", "enabled": true }
-     ]
+     }
    }
    ```
 
-   The `plugins` entry is what registers the **service**; the bar layout entry
-   places the **widget**. Both are required for the widget to see playback
-   state (it finds the service via `bar.shell.serviceFor("davidjm.cliamp")`).
+   The bar layout entry is enough. The shell treats a plugin as enabled when
+   its id appears *anywhere* in `shell.json` — `PluginRegistry.findEntryLocation`
+   checks `bar.layout` before `plugins[]` — so placing the widget in the bar
+   enables the **service** too, and the widget finds it via
+   `bar.shell.serviceFor("davidjm.cliamp")`. A separate `plugins[]` entry is
+   only needed for a service with no bar widget of its own.
+
+   Check it took effect with `omarchy plugin list`: `davidjm.cliamp` should read
+   `enabled`.
+
+   Note that `keepLoaded` is set, so the service instance survives plugin
+   hot-reload. **Edits to `Service.qml` therefore need a shell restart to take
+   effect** (`omarchy restart shell`); edits to the Python helpers do not, since
+   each IPC call spawns a fresh interpreter.
 3. Start the cliamp daemon (once, headless — the panel button does this too):
 
    ```sh
@@ -127,6 +135,28 @@ Quirks worked around:
   bounds a final unterminated line before flushing it.
 - Favourites toggled in the TUI while the widget is open show up at the next
   poll tick (default 2.5 s).
+- `omarchy-launch-terminal` needs the desktop session (`WAYLAND_DISPLAY`,
+  `HYPRLAND_INSTANCE_SIGNATURE`, `OMARCHY_PATH`) to reach the compositor, so
+  the *Open cliamp* button's child gets those on top of the scrubbed IPC
+  environment. Without them `uwsm-app` fails with "no compositor running" and
+  no window appears. `WAYLAND_DISPLAY` is recovered from the newest `wayland-*`
+  socket in `XDG_RUNTIME_DIR` when unset. The `cliamp` child itself stays on
+  the tight scrub.
+
+## Troubleshooting
+
+Child stderr is forwarded by the bridge and logged as
+`cliamp <source>: <message>` (sources: `stream`, `health`, `command`, `guard`,
+`daemon`, `favorites`), so cliamp's own explanations reach the shell log
+instead of `/dev/null`. Repeats are folded per source and the whole session is
+capped, because the health probe re-runs every few seconds.
+
+```
+grep cliamp "$(ls -t /run/user/$UID/quickshell/by-id/*/log.log | head -1)"
+```
+
+Remember the `keepLoaded` caveat above: after editing `Service.qml`, restart the
+shell before concluding that a logging or behaviour change did not work.
 
 ## Settings
 
