@@ -281,6 +281,18 @@ BarWidget {
                 visible: text !== ""
               }
             }
+
+            Button {
+              iconText: root.isCurrentTrackFavorited() ? "\u2605" : "\u2606"
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              selected: root.isCurrentTrackFavorited()
+              tooltipText: root.isCurrentTrackFavorited()
+                ? "Remove from favourites"
+                : "Add to favourites"
+              onClicked: root.toggleFavorite()
+            }
           }
 
           // --------------------------------------------------- progress group
@@ -731,5 +743,25 @@ BarWidget {
     var r = root.snap.repeat
     var n = r === "Off" ? "All" : (r === "All" ? "One" : "Off")
     root.svc.run(["repeat", n])
+  }
+
+  function isCurrentTrackFavorited() {
+    if (!root.hasTrack) return false
+    var path = root.snap.track.path
+    for (var i = 0; i < root.favoriteRows.length; i++) {
+      if (root.favoriteRows[i] && root.favoriteRows[i].path === path) return true
+    }
+    return false
+  }
+
+  function toggleFavorite() {
+    if (!root.svc || !root.hasTrack) return
+    var track = root.snap.track
+    var already = root.isCurrentTrackFavorited()
+    var params = already
+      ? { path: track.path }
+      : { path: track.path, title: track.title }
+    root.svc.run(["remote", "call", already ? "favorites.remove" : "favorites.add", "--params", JSON.stringify(params)])
+    root.svc.refreshFavorites()
   }
 }
