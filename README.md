@@ -111,6 +111,9 @@ Set `binary` in the widget settings to point at a non-default cliamp binary.
   it (`url.load` with `play: true`). The currently-playing favourite is
   highlighted. Refresh button on the right; the list also updates on daemon
   (re)connect and every `favPollMs`.
+- **Search & browse**: type in the search field to find stations or tracks via
+  cliamp's IPC search command. Results show with a play button — click one to
+  load and play it immediately, no need to open the cliamp TUI.
 - Footer: EQ preset + playback speed readout, favourite count, *Stop daemon*
   and *Open cliamp* buttons.
 
@@ -147,7 +150,7 @@ Quirks worked around:
 
 Child stderr is forwarded by the bridge and logged as
 `cliamp <source>: <message>` (sources: `stream`, `health`, `command`, `guard`,
-`daemon`, `favorites`), so cliamp's own explanations reach the shell log
+`daemon`, `favorites`, `search`), so cliamp's own explanations reach the shell log
 instead of `/dev/null`. Repeats are folded per source and the whole session is
 capped, because the health probe re-runs every few seconds.
 

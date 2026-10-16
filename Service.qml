@@ -601,6 +601,72 @@ Item {
     onTriggered: root.refreshFavorites()
   }
 
+  // ------------------------------------------------------------- search
+
+  property var searchResults: []
+  property bool searching: false
+  property int searchSession: 0
+  var searchBuffer: ""
+
+  Process {
+    id: searchProc
+    property int generation: -1
+    command: []
+    stdout: SplitParser {
+      id: searchOut
+      property string buffer: ""
+      onRead: function(data) {
+        if (searchProc.generation !== root.searchSession) return
+        var chunk = String(data || "")
+        buffer += chunk
+        while (true) {
+          var index = buffer.indexOf("\n")
+          if (index < 0) break
+          var line = buffer.slice(0, index).trim()
+          buffer = buffer.slice(index + 1)
+          if (!line) continue
+          try {
+            var obj = JSON.parse(line)
+            if (Array.isArray(obj)) {
+              root.searchResults = obj
+            } else if (obj && Array.isArray(obj.results)) {
+              root.searchResults = obj.results
+            }
+          } catch (e) {
+            // ignore unparseable lines
+          }
+        }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) { root.logStderr("search", line) }
+    }
+    onExited: function(exitCode) {
+      if (searchProc.generation !== root.searchSession) return
+      root.searching = false
+      searchProc.running = false
+    }
+  }
+
+  function search(query) {
+    if (searching || !query || !query.trim()) return
+    root.searching = true
+    root.searchResults = []
+    root.searchSession++
+    searchProc.generation = root.searchSession
+    searchOut.buffer = ""
+    var command = root.cliampCommand(["remote", "call", "search", "--params",
+      JSON.stringify({ query: query.trim() })])
+    if (command.length === 0) {
+      root.searching = false
+      root.lastError = "cliamp executable is invalid"
+      return
+    }
+    searchProc.command = [root.interpreterPath, "-I", root.bridgePath, "run",
+      "--max-output", "65536", "--timeout", "8", "--"].concat(command)
+    searchProc.running = true
+  }
+
   function cliampCommand(args) {
     var executable = Model.safeExecutable(root.cliampPath)
     if (!executable || !Array.isArray(args) || args.length > 16) return []
@@ -737,6 +803,7 @@ Item {
     root.favoritesSession++
     root.guardSession++
     root.daemonSession++
+    root.searchSession++
     root.commandGeneration++
     root.commandQueue = []
     root.commandRunning = false
@@ -744,6 +811,7 @@ Item {
     stream.running = false
     healthProc.running = false
     favoritesProc.running = false
+    searchProc.running = false
     daemonProc.running = false
     guardProc.running = false
     commandProc.running = false

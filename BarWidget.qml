@@ -60,6 +60,9 @@ BarWidget {
   }
 
   readonly property var favoriteRows: root.svc && root.svc.favorites
+  readonly property var searchResults: root.svc && root.svc.searchResults
+  readonly property bool searching: root.svc && root.svc.searching
+  property string searchQuery: ""
     ? root.svc.favorites : []
 
   function open() { popupOpen = true }
@@ -506,6 +509,159 @@ BarWidget {
             }
           }
 
+          // --------------------------------------------------------- search
+          Column {
+            width: parent.width
+            visible: !root.down
+            spacing: Style.spacing.labelGap * 2
+
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(10)
+
+              PanelSectionHeader {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                text: "Search stations & tracks"
+                width: parent.width - Style.space(8)
+                elide: Text.ElideRight
+              }
+            }
+
+            TextField {
+              width: parent.width
+              Layout.preferredHeight: Style.space(38)
+              placeholderText: "Search stations or tracks…"
+              placeholderTextColor: Color.muted
+              color: root.fg
+              font.family: root.fam
+              font.pixelSize: Style.font.body
+              text: root.searchQuery
+              onTextChanged: root.searchQuery = text
+              onAccepted: root.search()
+              background: Rectangle {
+                radius: Style.space(6)
+                color: "transparent"
+                border.width: 1
+                border.color: Color.menu.border
+              }
+            }
+
+            Flickable {
+              id: searchFlick
+              width: parent.width
+              height: Math.min(root.searchResults.length * Style.space(30) + (root.searchResults.length > 0 ? Style.space(2) : 0), Style.space(200))
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              contentHeight: root.searchResults.length * Style.space(30)
+              visible: root.searchResults.length > 0 || root.searching
+
+              Column {
+                width: parent.width
+                spacing: 0
+
+                Repeater {
+                  model: root.searchResults
+
+                  BorderSurface {
+                    required property var modelData
+                    required property int index
+
+                    width: searchFlick.width
+                    height: Style.space(30)
+                    radius: Style.spacing.labelGap
+                    color: "transparent"
+                    borderSpec: Border.none()
+
+                    Row {
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.spacing.controlGap
+
+                      Text {
+                        width: Style.space(18)
+                        textFormat: Text.PlainText
+                        text: index + 1
+                        color: Qt.darker(root.fg, 1.4)
+                        font.family: root.fam
+                        font.pixelSize: Style.font.bodySmall
+                        horizontalAlignment: Text.AlignHCenter
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Column {
+                        width: parent.width - Style.space(18) - Style.space(40) - Style.spacing.controlGap * 2
+                        spacing: Style.space(1)
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: modelData.title || modelData.name || modelData.path || "Unknown"
+                          color: root.fg
+                          font.family: root.fam
+                          font.pixelSize: Style.font.bodySmall
+                          elide: Text.ElideRight
+                        }
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: modelData.type === "station" ? "Station" : (modelData.stream ? "Stream" : "Track")
+                          color: Qt.darker(root.fg, 1.5)
+                          font.family: root.fam
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                        }
+                      }
+
+                      Button {
+                        iconText: "\uf04b"
+                        foreground: root.fg
+                        horizontalPadding: Style.spacing.controlPaddingX
+                        verticalPadding: 2
+                        tooltipText: "Play"
+                        onClicked: root.playSearchResult(modelData)
+                      }
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.playSearchResult(modelData)
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.searching
+              textFormat: Text.PlainText
+              text: "Searching…"
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+              width: parent.width
+              visible: root.searchResults.length === 0 && !root.searching && root.searchQuery !== ""
+              textFormat: Text.PlainText
+              text: "No results"
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+            }
+          }
+
           PanelSeparator {
             foreground: root.fg
             visible: !root.down
@@ -763,5 +919,20 @@ BarWidget {
       : { path: track.path, title: track.title }
     root.svc.run(["remote", "call", already ? "favorites.remove" : "favorites.add", "--params", JSON.stringify(params)])
     root.svc.refreshFavorites()
+  }
+
+  function search() {
+    if (!root.svc) return
+    var q = String(root.searchQuery || "").trim()
+    if (!q) return
+    root.svc.search(q)
+  }
+
+  function playSearchResult(item) {
+    if (!root.svc || !item) return
+    var path = item.path || item.url || ""
+    if (!path) return
+    root.svc.run(["remote", "call", "url.load", "--params",
+      JSON.stringify({ path: path, play: true })])
   }
 }
