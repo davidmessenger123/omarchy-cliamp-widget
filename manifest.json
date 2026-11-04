@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "davidjm.cliamp",
   "name": "Cliamp in the Bar",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "David JM",
   "license": "MIT",
   "description": "Cliamp's headless daemon, tamed into an Omarchy bar widget: now-playing, seek, volume, repeat/shuffle/mono, and your list of favourites \u2014 plus a launch button for the full TUI.",

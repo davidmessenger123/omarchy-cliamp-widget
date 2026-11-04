@@ -606,7 +606,6 @@ Item {
   property var searchResults: []
   property bool searching: false
   property int searchSession: 0
-  var searchBuffer: ""
 
   Process {
     id: searchProc

@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import qs.Ui
 import qs.Commons
@@ -59,11 +60,10 @@ BarWidget {
     if (root.svc) root.svc.run(["toggle"])
   }
 
-  readonly property var favoriteRows: root.svc && root.svc.favorites
-  readonly property var searchResults: root.svc && root.svc.searchResults
-  readonly property bool searching: root.svc && root.svc.searching
+  readonly property var favoriteRows: root.svc && root.svc.favorites ? root.svc.favorites : []
+  readonly property var searchResults: root.svc && root.svc.searchResults ? root.svc.searchResults : []
+  readonly property bool searching: root.svc ? root.svc.searching === true : false
   property string searchQuery: ""
-    ? root.svc.favorites : []
 
   function open() { popupOpen = true }
   function close() { popupOpen = false }
