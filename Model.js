@@ -11,6 +11,7 @@ var FG = "#cacccc"
 var MAX_SAFE_INTEGER = 9007199254740991
 var MAX_TEXT_LENGTH = 4096
 var MAX_TRACKS = 10000
+var MAX_QUEUE_ROWS = 100
 var MAX_EVENT_LINE = 256 * 1024
 var MAX_FAVORITES_BYTES = 256 * 1024
 var MAX_FAVORITES_ENTRIES = 2000
@@ -301,7 +302,9 @@ function parseQueueJob(stdout) {
   var result = isObject(job.result) ? job.result : {}
   var rawTracks = Array.isArray(result.tracks) ? result.tracks : []
   if (rawTracks.length > MAX_TRACKS) return empty
+  var snapshot = isObject(obj.snapshot) ? obj.snapshot : {}
   var fallbackIndex = clampInt(result.index, -1, MAX_SAFE_INTEGER, -1)
+  if (fallbackIndex < 0) fallbackIndex = clampInt(snapshot.index, -1, MAX_SAFE_INTEGER, -1)
   var tracks = []
   for (var i = 0; i < rawTracks.length; i++) {
     var raw = rawTracks[i]
@@ -309,6 +312,7 @@ function parseQueueJob(stdout) {
     var index = clampInt(raw.index, -1, MAX_SAFE_INTEGER, -1)
     if (index < 0) index = tracks.length
     var path = boundedText(raw.path, MAX_TEXT_LENGTH * 4, "")
+    var duration = finiteNumber(raw.duration) ? raw.duration : raw.duration_secs
     tracks.push({
       index: index,
       title: boundedText(raw.title, MAX_TEXT_LENGTH, ""),
@@ -316,9 +320,30 @@ function parseQueueJob(stdout) {
       album: boundedText(raw.album, MAX_TEXT_LENGTH, ""),
       path: path,
       stream: raw.stream === true || raw.realtime === true || /^https?:/i.test(path),
-      duration: clampNum(raw.duration, 0, Number.MAX_VALUE, 0),
-      current: index === fallbackIndex
+      duration: clampNum(duration, 0, Number.MAX_VALUE, 0),
+      current: false
     })
+  }
+  // cliamp omits a zero index from JSON, so an omitted result/snapshot index
+  // can also mean "the first track is playing". Match the snapshot's logical
+  // track path when the queue is active to recover that case.
+  if (fallbackIndex < 0) {
+    var state = String(snapshot.state || "").toLowerCase()
+    var currentPath = isObject(snapshot.track)
+      ? boundedText(snapshot.track.path, MAX_TEXT_LENGTH * 4, "")
+      : (isObject(snapshot.logical_track)
+        ? boundedText(snapshot.logical_track.path, MAX_TEXT_LENGTH * 4, "") : "")
+    if ((state === STATE_PLAYING || state === STATE_PAUSED) && currentPath !== "") {
+      for (var j = 0; j < tracks.length; j++) {
+        if (tracks[j].path === currentPath) {
+          fallbackIndex = tracks[j].index
+          break
+        }
+      }
+    }
+  }
+  for (var k = 0; k < tracks.length; k++) {
+    tracks[k].current = tracks[k].index === fallbackIndex
   }
   return {
     ok: true,
@@ -326,6 +351,14 @@ function parseQueueJob(stdout) {
     index: fallbackIndex,
     tracks: tracks
   }
+}
+
+// The panel keeps its Repeater bounded even if a caller hands it a larger
+// queue page. Service caps the request as well; this is the UI safety net.
+function boundedQueueRows(tracks, limit) {
+  if (!Array.isArray(tracks)) return []
+  var cap = clampInt(limit, 0, MAX_TRACKS, MAX_QUEUE_ROWS)
+  return tracks.length > cap ? tracks.slice(0, cap) : tracks.slice(0)
 }
 
 function stripTomlComment(value) {
@@ -506,6 +539,7 @@ if (typeof module !== "undefined" && module.exports) {
     snapshotFrom: snapshotFrom,
     shouldApplySnapshot: shouldApplySnapshot,
     parseQueueJob: parseQueueJob,
+    boundedQueueRows: boundedQueueRows,
     parseFavoritesToml: parseFavoritesToml,
     safeFavoritesPath: safeFavoritesPath,
     safePid: safePid,
@@ -531,6 +565,7 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_SAFE_INTEGER: MAX_SAFE_INTEGER,
     MAX_TEXT_LENGTH: MAX_TEXT_LENGTH,
     MAX_TRACKS: MAX_TRACKS,
+    MAX_QUEUE_ROWS: MAX_QUEUE_ROWS,
     MAX_EVENT_LINE: MAX_EVENT_LINE,
     MAX_FAVORITES_BYTES: MAX_FAVORITES_BYTES,
     MAX_FAVORITES_ENTRIES: MAX_FAVORITES_ENTRIES

@@ -36,6 +36,23 @@ Item {
   property var favorites: []
   property string favoritesSource: ""
 
+  // --------------------------------------------------------------- queue
+  // Live playlist (cliamp's queue.* operations). The list is capped to one
+  // page so the panel never instantiates an unbounded Repeater.
+  property var queueTracks: []
+  property int queueTotal: 0
+  property int queueIndex: -1
+  property bool queueLoading: false
+  property bool queueMutating: false
+  property int queueRevision: 0
+  property string queueError: ""
+  property bool queueVisible: false
+  property int queueSession: 0
+  property int queueMutationRevision: 0
+  property bool queueRefreshPending: false
+  readonly property int queuePageSize: Model.MAX_QUEUE_ROWS
+  readonly property int queueMaxOutput: 1024 * 1024
+
   property var settings: ({})
   property var pendingSettings: ({})
   property bool settingsFlushPending: false
@@ -48,6 +65,11 @@ Item {
   property bool commandRunning: false
   property string currentCommandKey: ""
   property int commandGeneration: 0
+  property bool commandCollect: false
+  property string commandOutput: ""
+  property bool commandOverflow: false
+  property int commandMaxOutput: 65536
+  property var currentCommandCallback: null
   readonly property int maxCommandQueue: 32
 
   // Child stderr is where cliamp explains itself ("cliamp is not running",
@@ -330,6 +352,7 @@ Item {
     if (!Model.shouldApplySnapshot(snap, root.lastEventRevision, root.streamSession, sourceSession)) return false
     if (!snap.track) return false
     var wasConnected = root.connected
+    var wasPlaylistRevision = root.snapshot.playlistRevision
     if (snap.revision >= 0) root.lastEventRevision = snap.revision
     root.lastGoodSnapshot = snap
     root.lastGoodValid = true
@@ -345,6 +368,11 @@ Item {
     if (!wasConnected) {
       root.reconnectTry = 0
       root.refreshFavorites()
+      if (root.queueVisible) root.refreshQueue()
+    } else if (root.queueVisible && snap.playlistRevision !== wasPlaylistRevision) {
+      // External queue edits (TUI, MPRIS, another client) arrive as playlist
+      // revision bumps. Defer while closed so a hidden panel never polls.
+      root.refreshQueue()
     }
     return true
   }
@@ -370,6 +398,19 @@ Item {
     root.commandQueue = []
     root.commandRunning = false
     root.currentCommandKey = ""
+    root.currentCommandCallback = null
+    root.commandCollect = false
+    root.commandOutput = ""
+    root.commandOverflow = false
+    root.queueSession++
+    root.queueLoading = false
+    root.queueMutating = false
+    root.queueRefreshPending = false
+    root.queueTracks = []
+    root.queueTotal = 0
+    root.queueIndex = -1
+    root.queueRevision++
+    root.queueError = root.lastError
     root.scheduleReconnect()
   }
 
@@ -669,6 +710,159 @@ Item {
     searchProc.running = true
   }
 
+  // ---------------------------------------------------------------- queue
+  //
+  // queue.list and every queue mutation run through the bounded command
+  // runner, so they are serialized with the rest of the IPC traffic. A list
+  // response is only applied when its session, mutation revision, and the
+  // snapshot's playlist revision still match the request.
+
+  function setQueueVisible(value) {
+    var visible = value === true
+    if (root.queueVisible === visible) {
+      if (visible) root.refreshQueue()
+      return
+    }
+    root.queueVisible = visible
+    if (visible) root.refreshQueue()
+  }
+
+  function refreshQueue() {
+    if (!root.connected) {
+      root.queueLoading = false
+      root.queueMutating = false
+      root.queueRefreshPending = false
+      root.queueError = root.lastError || "Cliamp is not running"
+      return false
+    }
+    if (root.queueLoading || root.queueMutating) {
+      root.queueRefreshPending = true
+      return false
+    }
+    var limit = Model.clampInt(root.queuePageSize, 1, Model.MAX_QUEUE_ROWS, Model.MAX_QUEUE_ROWS)
+    var params = JSON.stringify({ "offset": 0, "limit": limit })
+    var session = ++root.queueSession
+    var requestRevision = root.queueRevision
+    var mutationRevision = root.queueMutationRevision
+    var playlistRevision = root.snapshot.playlistRevision
+    root.queueLoading = true
+    root.queueRefreshPending = false
+    var started = root.runWithCallback(
+      ["remote", "call", "queue.list", "--params", params, "--wait"],
+      root.queueMaxOutput, function(ok, output) {
+        if (session !== root.queueSession) return
+        root.queueLoading = false
+        if (requestRevision !== root.queueRevision) {
+          root.queueRefreshPending = false
+          root.refreshQueue()
+          return
+        }
+        if (!ok) {
+          root.queueError = "Could not load the cliamp queue"
+          if (root.queueRefreshPending) {
+            root.queueRefreshPending = false
+            root.refreshQueue()
+          }
+          return
+        }
+        if (mutationRevision !== root.queueMutationRevision ||
+            playlistRevision !== root.snapshot.playlistRevision) {
+          // A mutation or an external playlist edit landed while this page
+          // was in flight. Drop it and request the current state.
+          root.queueRefreshPending = false
+          root.refreshQueue()
+          return
+        }
+        var parsed = Model.parseQueueJob(output)
+        if (!parsed.ok) {
+          root.queueError = "Could not read the cliamp queue"
+          if (root.queueRefreshPending) {
+            root.queueRefreshPending = false
+            root.refreshQueue()
+          }
+          return
+        }
+        root.queueTracks = parsed.tracks
+        root.queueTotal = parsed.total
+        root.queueIndex = parsed.index
+        root.queueRevision++
+        root.queueError = ""
+        if (root.queueRefreshPending) {
+          root.queueRefreshPending = false
+          root.refreshQueue()
+        }
+      }, true)
+    if (!started) {
+      root.queueLoading = false
+      root.queueError = "cliamp is not available"
+      return false
+    }
+    return true
+  }
+
+  function queueMutation(operation, params, failure) {
+    if (!root.connected) {
+      root.queueError = "Cliamp is not running"
+      return false
+    }
+    if (root.queueLoading || root.queueMutating) return false
+    root.queueMutationRevision++
+    root.queueMutating = true
+    root.queueError = ""
+    var started = root.runWithCallback(
+      ["remote", "call", operation, "--params", JSON.stringify(params), "--wait"],
+      65536, function(ok, output) {
+        root.queueMutating = false
+        if (!ok) {
+          root.queueRefreshPending = false
+          root.queueError = failure
+          root.queueRevision++
+          return
+        }
+        root.queueError = ""
+        root.refreshQueue()
+      }, false)
+    if (!started) {
+      root.queueMutating = false
+      root.queueError = "Could not send the queue command"
+      return false
+    }
+    return true
+  }
+
+  function queuePlay(index) {
+    var total = root.queueTotal
+    if (total <= 0) return false
+    var target = Model.clampInt(index, 0, total - 1, -1)
+    if (target < 0) return false
+    return root.queueMutation("queue.play", { "index": target },
+      "Could not play that queue track")
+  }
+
+  function queueRemove(index) {
+    var total = root.queueTotal
+    if (total <= 0) return false
+    var target = Model.clampInt(index, 0, total - 1, -1)
+    if (target < 0) return false
+    return root.queueMutation("queue.remove", { "index": target },
+      "Could not remove that queue track")
+  }
+
+  function queueMove(index, to) {
+    var total = root.queueTotal
+    if (total <= 1) return false
+    var from = Model.clampInt(index, 0, total - 1, -1)
+    var target = Model.clampInt(to, 0, total - 1, -1)
+    if (from < 0 || target < 0 || from === target) return false
+    return root.queueMutation("queue.move", { "index": from, "to": target },
+      "Could not move that queue track")
+  }
+
+  function queueClear() {
+    if (root.queueTotal <= 0) return false
+    return root.queueMutation("queue.clear", {}, "Could not clear the cliamp queue")
+  }
+
   function cliampCommand(args) {
     var executable = Model.safeExecutable(root.cliampPath)
     if (!executable || !Array.isArray(args) || args.length > 16) return []
@@ -715,24 +909,38 @@ Item {
   }
 
   function run(args) {
-    if (!Array.isArray(args) || args.length > 16) return
+    return root.runWithCallback(args, 65536, null, false)
+  }
+
+  // The queue needs command stdout plus a completion signal. Everything still
+  // flows through the one bounded process, so a queue.list request cannot
+  // overlap a mutation or a playback command.
+  function runWithCallback(args, maximum, callback, collect) {
+    if (!Array.isArray(args) || args.length > 16) return false
     var safeArgs = []
     for (var i = 0; i < args.length; i++) {
       var value = String(args[i] === undefined || args[i] === null ? "" : args[i])
-      if (value.length > Model.MAX_EVENT_LINE || /[\x00-\x1f\x7f]/.test(value)) return
+      if (value.length > Model.MAX_EVENT_LINE || /[\x00-\x1f\x7f]/.test(value)) return false
       safeArgs.push(value)
     }
     var key = Model.commandKey(safeArgs)
-    if (!key || root.currentCommandKey === key) return
+    if (!key || root.currentCommandKey === key) return false
     var pending = root.commandQueue.slice(0)
-    for (var j = 0; j < pending.length; j++) if (pending[j].key === key) return
+    for (var j = 0; j < pending.length; j++) if (pending[j].key === key) return false
     if (pending.length >= root.maxCommandQueue) {
       root.lastError = "cliamp command queue is full"
-      return
+      return false
     }
-    pending.push({ "key": key, "args": safeArgs })
+    pending.push({
+      "key": key,
+      "args": safeArgs,
+      "maxOutput": Model.clampInt(maximum, 1024, 1024 * 1024, 65536),
+      "callback": typeof callback === "function" ? callback : null,
+      "collect": collect === true
+    })
     root.commandQueue = pending
     root.commandNext()
+    return true
   }
 
   function commandNext() {
@@ -740,14 +948,20 @@ Item {
     var pending = root.commandQueue.slice(0)
     var job = pending.shift()
     root.commandQueue = pending
-    var command = root.boundedRunCommand(job.args, 65536)
+    var command = root.boundedRunCommand(job.args, job.maxOutput || 65536)
     if (command.length === 0) {
       root.lastError = "cliamp executable is invalid"
+      if (typeof job.callback === "function") job.callback(false, "")
       root.commandNext()
       return
     }
     root.commandRunning = true
     root.currentCommandKey = job.key
+    root.currentCommandCallback = job.callback
+    root.commandCollect = job.collect === true
+    root.commandMaxOutput = job.maxOutput || 65536
+    root.commandOutput = ""
+    root.commandOverflow = false
     commandProc.generation = ++root.commandGeneration
     commandProc.timedOut = false
     commandProc.command = command
@@ -755,12 +969,38 @@ Item {
     commandProc.running = true
   }
 
+  function finishCommand(ok) {
+    var callback = root.currentCommandCallback
+    var output = root.commandOutput
+    var overflow = root.commandOverflow
+    root.commandRunning = false
+    root.currentCommandKey = ""
+    root.currentCommandCallback = null
+    root.commandCollect = false
+    root.commandOutput = ""
+    root.commandOverflow = false
+    root.commandNext()
+    if (typeof callback === "function") callback(ok && !overflow, overflow ? "" : output)
+  }
+
   Process {
     id: commandProc
     property int generation: -1
     property bool timedOut: false
     command: []
-    stdout: SplitParser {}
+    stdout: SplitParser {
+      id: commandOut
+      onRead: function(data) {
+        if (!root.commandCollect) return
+        var chunk = String(data || "")
+        if (root.commandOutput.length + chunk.length + 1 > root.commandMaxOutput) {
+          root.commandOverflow = true
+          root.commandOutput = ""
+          return
+        }
+        root.commandOutput += chunk + "\n"
+      }
+    }
     stderr: SplitParser {
       onRead: function(line) { root.logStderr("command", line) }
     }
@@ -769,9 +1009,7 @@ Item {
       commandTimeout.stop()
       commandProc.running = false
       commandProc.timedOut = false
-      root.commandRunning = false
-      root.currentCommandKey = ""
-      root.commandNext()
+      root.finishCommand(exitCode === 0)
     }
   }
 
@@ -786,10 +1024,8 @@ Item {
       commandProc.running = false
       commandProc.generation = -1
       commandTimeout.stop()
-      root.commandRunning = false
-      root.currentCommandKey = ""
       root.lastError = "cliamp command timed out"
-      root.commandNext()
+      root.finishCommand(false)
     }
   }
 
@@ -843,6 +1079,14 @@ Item {
     root.commandQueue = []
     root.commandRunning = false
     root.currentCommandKey = ""
+    root.currentCommandCallback = null
+    root.commandCollect = false
+    root.commandOutput = ""
+    root.commandOverflow = false
+    root.queueSession++
+    root.queueLoading = false
+    root.queueMutating = false
+    root.queueRefreshPending = false
     stream.running = false
     healthProc.running = false
     favoritesProc.running = false

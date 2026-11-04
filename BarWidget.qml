@@ -66,12 +66,26 @@ BarWidget {
   readonly property bool sleepActive: root.svc ? root.svc.sleepActive === true : false
   readonly property string sleepLabel: root.svc
     ? Math.max(1, Math.ceil(root.svc.sleepRemaining / 60)) + "m" : ""
+  readonly property var queueRows: root.svc
+    ? Model.boundedQueueRows(root.svc.queueTracks, Model.MAX_QUEUE_ROWS) : []
+  readonly property int queueTotal: root.svc ? root.svc.queueTotal : 0
+  readonly property int queueIndex: root.svc ? root.svc.queueIndex : -1
+  readonly property bool queueLoading: root.svc ? root.svc.queueLoading === true : false
+  readonly property bool queueMutating: root.svc ? root.svc.queueMutating === true : false
+  readonly property bool queueBusy: root.queueLoading || root.queueMutating
+  readonly property string queueError: root.svc ? String(root.svc.queueError || "") : ""
+  readonly property int queueHidden: Math.max(0, root.queueTotal - root.queueRows.length)
   property string searchQuery: ""
 
   function open() { popupOpen = true }
   function close() { popupOpen = false }
   function refresh() { if (root.svc) root.svc.refreshFavorites() }
   function togglePanel() { root.popupOpen = !root.popupOpen }
+
+  // The service only polls the live queue while the panel is visible; making
+  // it visible calls refreshQueue() once on open.
+  onPopupOpenChanged: if (root.svc) root.svc.setQueueVisible(root.popupOpen)
+  onSvcChanged: if (root.popupOpen && root.svc) root.svc.setQueueVisible(true)
 
   function startDaemon() {
     if (root.svc) root.svc.startDaemon()
@@ -722,6 +736,263 @@ BarWidget {
             visible: !root.down
           }
 
+          // ----------------------------------------------------------- queue
+          Column {
+            id: queueSection
+            width: parent.width
+            visible: !root.down
+            spacing: Style.spacing.labelGap * 2
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(queueHeader.implicitHeight, queueActionRow.implicitHeight)
+
+              PanelSectionHeader {
+                id: queueHeader
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                text: "Queue"
+                width: Math.max(0, parent.width - queueActionRow.implicitWidth - Style.space(8))
+                elide: Text.ElideRight
+              }
+
+              Row {
+                id: queueActionRow
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.controlGap
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: root.queueTotal > 0
+                  textFormat: Text.PlainText
+                  text: root.queueTotal + (root.queueTotal === 1 ? " track" : " tracks")
+                  color: Qt.darker(root.fg, 1.4)
+                  font.family: root.fam
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  iconText: "\uf021"
+                  foreground: root.fg
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: 2
+                  tooltipText: "Refresh queue"
+                  onClicked: root.refreshQueue()
+                }
+
+                Button {
+                  iconText: "\uf00d"
+                  foreground: root.fg
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: 2
+                  visible: root.queueTotal > 0
+                  enabled: !root.queueBusy
+                  tooltipText: "Clear the queue"
+                  onClicked: root.clearQueue()
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.queueLoading
+              textFormat: Text.PlainText
+              text: "Loading queue…"
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+              width: parent.width
+              visible: root.queueError !== "" && !root.queueLoading
+              textFormat: Text.PlainText
+              text: root.queueError
+              color: root.bar ? root.bar.urgent : Color.urgent
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideRight
+            }
+
+            Flickable {
+              id: queueList
+              width: parent.width
+              height: Math.min(
+                root.queueRows.length * Style.space(30) + (root.queueRows.length > 0 ? Style.space(2) : 0),
+                Style.space(240))
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              contentHeight: root.queueRows.length * Style.space(30)
+              visible: root.queueRows.length > 0
+
+              Column {
+                width: parent.width
+                spacing: 0
+
+                Repeater {
+                  model: root.queueRows
+
+                  BorderSurface {
+                    id: queueRow
+                    required property var modelData
+                    required property int index
+
+                    readonly property var track: modelData
+                    readonly property int trackIndex: typeof track.index === "number"
+                      ? track.index : index
+                    readonly property bool current: track.current === true ||
+                      (root.queueIndex >= 0 && root.queueIndex === trackIndex)
+
+                    width: queueList.width
+                    height: Style.space(30)
+                    radius: Style.spacing.labelGap
+                    color: current ? Style.selectedFillFor(root.fg, Color.accent) : "transparent"
+                    borderSpec: current ? Border.controlSpec("normal", root.fg, Color.accent) : Border.none()
+
+                    MouseArea {
+                      anchors.fill: parent
+                      enabled: !root.queueBusy
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.playQueueRow(queueRow.trackIndex)
+                    }
+
+                    Row {
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.spacing.controlGap
+
+                      Text {
+                        id: queueTrackIndex
+                        width: Style.space(18)
+                        textFormat: Text.PlainText
+                        text: queueRow.current ? "󰐊" : (queueRow.trackIndex + 1)
+                        color: queueRow.current ? Color.accent : Qt.darker(root.fg, 1.4)
+                        font.family: root.fam
+                        font.pixelSize: Style.font.bodySmall
+                        horizontalAlignment: Text.AlignHCenter
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Column {
+                        width: Math.max(0, parent.width - queueTrackIndex.width - queueDuration.width
+                          - queueRowActions.implicitWidth - Style.spacing.controlGap * 3)
+                        spacing: Style.space(1)
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: queueRow.track.title || queueRow.track.path || "Unknown track"
+                          color: root.fg
+                          font.family: root.fam
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: queueRow.current
+                          elide: Text.ElideRight
+                        }
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: queueRow.track.artist
+                            || (queueRow.track.stream ? "stream" : "")
+                          color: Qt.darker(root.fg, 1.5)
+                          font.family: root.fam
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                          visible: text !== ""
+                        }
+                      }
+
+                      Text {
+                        id: queueDuration
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: queueRow.track.stream
+                          ? "LIVE"
+                          : (queueRow.track.duration > 0
+                            ? Model.formatTime(queueRow.track.duration) : "")
+                        color: Qt.darker(root.fg, 1.6)
+                        font.family: root.fam
+                        font.pixelSize: Style.font.caption
+                        width: Style.space(44)
+                        horizontalAlignment: Text.AlignRight
+                      }
+
+                      Row {
+                        id: queueRowActions
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Style.space(1)
+
+                        Button {
+                          iconText: "\uf077"
+                          foreground: root.fg
+                          horizontalPadding: Style.space(3)
+                          verticalPadding: 2
+                          enabled: !root.queueBusy && queueRow.trackIndex > 0
+                          tooltipText: "Move up"
+                          onClicked: root.moveQueueRow(queueRow.trackIndex, -1)
+                        }
+                        Button {
+                          iconText: "\uf078"
+                          foreground: root.fg
+                          horizontalPadding: Style.space(3)
+                          verticalPadding: 2
+                          enabled: !root.queueBusy && queueRow.trackIndex < root.queueTotal - 1
+                          tooltipText: "Move down"
+                          onClicked: root.moveQueueRow(queueRow.trackIndex, 1)
+                        }
+                        Button {
+                          iconText: "\uf00d"
+                          foreground: root.fg
+                          horizontalPadding: Style.space(3)
+                          verticalPadding: 2
+                          enabled: !root.queueBusy
+                          tooltipText: "Remove from queue"
+                          onClicked: root.removeQueueRow(queueRow.trackIndex)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.queueRows.length === 0 && !root.queueLoading && root.queueError === ""
+              textFormat: Text.PlainText
+              text: "Queue is empty"
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+              width: parent.width
+              visible: root.queueHidden > 0 && !root.queueLoading
+              textFormat: Text.PlainText
+              text: "Showing first " + root.queueRows.length + " of " + root.queueTotal + " tracks"
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fam
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideRight
+            }
+          }
+
+          PanelSeparator {
+            foreground: root.fg
+            visible: !root.down
+          }
+
           // -------------------------------------------------------- playlist
           Column {
             width: parent.width
@@ -755,7 +1026,7 @@ BarWidget {
             }
 
             Flickable {
-              id: queueFlick
+              id: favoritesFlick
               width: parent.width
               height: Math.min(root.favoriteRows.length * Style.space(30) + (root.favoriteRows.length > 0 ? Style.space(2) : 0), Style.space(300))
               clip: true
@@ -778,7 +1049,7 @@ BarWidget {
                     readonly property bool current: root.hasTrack &&
                       track.path !== "" && track.path === root.snap.track.path
 
-                    width: queueFlick.width
+                    width: favoritesFlick.width
                     height: Style.space(30)
                     radius: Style.spacing.labelGap
                     color: current ? Style.selectedFillFor(root.fg, Color.accent) : "transparent"
@@ -989,5 +1260,25 @@ BarWidget {
     if (!path) return
     root.svc.run(["remote", "call", "url.load", "--params",
       JSON.stringify({ path: path, play: true })])
+  }
+
+  function refreshQueue() {
+    if (root.svc) root.svc.refreshQueue()
+  }
+
+  function playQueueRow(index) {
+    if (root.svc) root.svc.queuePlay(index)
+  }
+
+  function removeQueueRow(index) {
+    if (root.svc) root.svc.queueRemove(index)
+  }
+
+  function moveQueueRow(index, delta) {
+    if (root.svc) root.svc.queueMove(index, index + delta)
+  }
+
+  function clearQueue() {
+    if (root.svc) root.svc.queueClear()
   }
 }

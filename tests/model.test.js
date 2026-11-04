@@ -64,6 +64,66 @@ test('validates paths, pids, and queue size', () => {
   assert.equal(model.parseQueueJob(JSON.stringify(oversized)).ok, false)
 })
 
+test('parses queue durations and recovers the implicit zero index', () => {
+  const response = {
+    ok: true,
+    snapshot: {
+      state: 'playing',
+      playlist_revision: 8,
+      track: { title: 'First', path: '/music/first.flac' }
+    },
+    job: {
+      state: 'succeeded',
+      result: {
+        total: 3,
+        tracks: [
+          { title: 'First', path: '/music/first.flac', duration_secs: 61 },
+          { title: 'Second', path: '/music/second.flac', duration: 62.5 },
+          { title: 'Live', path: 'https://example.test/live', realtime: true }
+        ]
+      }
+    }
+  }
+  const queue = model.parseQueueJob(JSON.stringify(response))
+  assert.equal(queue.ok, true)
+  assert.equal(queue.total, 3)
+  assert.equal(queue.index, 0)
+  assert.equal(queue.tracks[0].current, true)
+  assert.equal(queue.tracks[1].current, false)
+  assert.equal(queue.tracks[0].duration, 61)
+  assert.equal(queue.tracks[1].duration, 62.5)
+  assert.equal(queue.tracks[2].stream, true)
+})
+
+test('keeps queue parsing bounded and caps the displayed rows', () => {
+  const response = {
+    ok: true,
+    job: {
+      state: 'succeeded',
+      result: {
+        total: 3,
+        index: 1,
+        tracks: [
+          { title: 'First', path: '/music/first.flac' },
+          { title: 'Second', path: '/music/second.flac' },
+          { title: 'Third', path: '/music/third.flac' }
+        ]
+      }
+    }
+  }
+  const queue = model.parseQueueJob(JSON.stringify(response))
+  assert.equal(queue.index, 1)
+  assert.equal(queue.tracks[1].current, true)
+  assert.equal(model.parseQueueJob('not json').ok, false)
+  assert.equal(model.parseQueueJob(JSON.stringify({ ok: false, job: {} })).ok, false)
+
+  const rows = Array.from({ length: model.MAX_QUEUE_ROWS + 25 }, (_, index) => ({ index }))
+  const visible = model.boundedQueueRows(rows, model.MAX_QUEUE_ROWS)
+  assert.equal(visible.length, model.MAX_QUEUE_ROWS)
+  assert.equal(visible[0].index, 0)
+  assert.equal(model.boundedQueueRows(null, 10).length, 0)
+})
+
 test('bounds settings and command identities', () => {
   const settings = model.boundedSettings({ binary: 'cliamp', reconnectMs: 10, extra: 'x' })
   assert.deepEqual(settings, { binary: 'cliamp', reconnectMs: 10 })

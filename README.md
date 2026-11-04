@@ -2,9 +2,9 @@
 
 Cliamp in the bar. A [cliamp](https://github.com/) terminal music player
 widget + service for the Omarchy shell: a compact now-playing pill, full
-transport controls, your **favourites** list, seek, volume, and the
-repeat/shuffle/mono modes — all driven over cliamp's headless IPC daemon and
-its favourites store.
+transport controls, a live **queue** editor, your **favourites** list, seek,
+volume, and the repeat/shuffle/mono modes — all driven over cliamp's headless
+IPC daemon and its favourites store.
 
 ## What you get
 
@@ -114,6 +114,12 @@ Set `binary` in the widget settings to point at a non-default cliamp binary.
 - **Search & browse**: type in the search field to find stations or tracks via
   cliamp's IPC search command. Results show with a play button — click one to
   load and play it immediately, no need to open the cliamp TUI.
+- **Live queue**: the first 100 tracks of cliamp's live playlist, with title,
+  artist, and duration. The playing row is highlighted. Click a row to play it;
+  use the per-row buttons to move it up/down or remove it, or clear the whole
+  queue from the header. The list refreshes when the panel opens, after edits,
+  and when cliamp publishes a new playlist revision — it does not poll while
+  the panel is closed.
 - Footer: EQ preset + playback speed readout, favourite count, *Stop daemon*
   and *Open cliamp* buttons.
 
@@ -127,6 +133,9 @@ watchdog when playback is idle. Daemon start/stop uses a pidfd-backed identity
 check (`process_guard.py`) rather than a broad process match or a bare PID
 signal. The last validated snapshot is retained across transient disconnects,
 and playback/settings commands use a bounded, duplicate-suppressing queue.
+Live-queue reads (`queue.list`) and edits (`queue.play`, `queue.remove`,
+`queue.move`, `queue.clear`) share that same serialized runner; list responses
+are rejected when their session or playlist revision is stale.
 Favourites are read by `favorites_reader.py` with no-follow, nonblocking,
 ownership, type, link-count, size, and descriptor-stability checks. When the
 daemon disappears the service backs off exponentially (settings `reconnectMs`
