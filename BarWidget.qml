@@ -63,6 +63,9 @@ BarWidget {
   readonly property var favoriteRows: root.svc && root.svc.favorites ? root.svc.favorites : []
   readonly property var searchResults: root.svc && root.svc.searchResults ? root.svc.searchResults : []
   readonly property bool searching: root.svc ? root.svc.searching === true : false
+  readonly property bool sleepActive: root.svc ? root.svc.sleepActive === true : false
+  readonly property string sleepLabel: root.svc
+    ? Math.max(1, Math.ceil(root.svc.sleepRemaining / 60)) + "m" : ""
   property string searchQuery: ""
 
   function open() { popupOpen = true }
@@ -463,6 +466,58 @@ BarWidget {
                 tooltipText: "Mono output"
                 onClicked: if (root.svc) root.svc.run(["mono", "toggle"])
               }
+            }
+          }
+
+          // ------------------------------------------------------- sleep timer
+          Row {
+            width: parent.width
+            spacing: Style.spacing.controlGap
+            visible: !root.down
+
+            Text {
+              width: Style.space(46)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Sleep"
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignRight
+            }
+
+            Button {
+              text: "15m"
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              tooltipText: "Pause playback in 15 minutes"
+              onClicked: if (root.svc) root.svc.setSleep(15)
+            }
+            Button {
+              text: "30m"
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              tooltipText: "Pause playback in 30 minutes"
+              onClicked: if (root.svc) root.svc.setSleep(30)
+            }
+            Button {
+              text: "1h"
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              tooltipText: "Pause playback in one hour"
+              onClicked: if (root.svc) root.svc.setSleep(60)
+            }
+            Button {
+              visible: root.sleepActive
+              text: "Off " + root.sleepLabel
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              selected: true
+              tooltipText: "Cancel the sleep timer"
+              onClicked: if (root.svc) root.svc.cancelSleep()
             }
           }
 

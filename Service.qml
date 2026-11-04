@@ -42,6 +42,9 @@ Item {
   property int settingsRevision: 0
 
   property var commandQueue: []
+  property real sleepUntil: 0
+  property int sleepRemaining: 0
+  readonly property bool sleepActive: root.sleepRemaining > 0
   property bool commandRunning: false
   property string currentCommandKey: ""
   property int commandGeneration: 0
@@ -678,6 +681,39 @@ Item {
     return values
   }
 
+  function setSleep(minutes) {
+    var value = Number(minutes)
+    if (!isFinite(value) || value <= 0) return root.cancelSleep()
+    value = Math.max(1, Math.min(480, Math.round(value)))
+    root.sleepUntil = Date.now() + value * 60 * 1000
+    root.sleepRemaining = value * 60
+    sleepTimer.restart()
+    return "sleeping"
+  }
+
+  function cancelSleep() {
+    root.sleepUntil = 0
+    root.sleepRemaining = 0
+    sleepTimer.stop()
+    return "off"
+  }
+
+  Timer {
+    id: sleepTimer
+    interval: 5000
+    repeat: true
+    running: root.sleepUntil > 0
+    onTriggered: {
+      var remaining = Math.max(0, Math.ceil((root.sleepUntil - Date.now()) / 1000))
+      root.sleepRemaining = remaining
+      if (remaining > 0) return
+      root.sleepUntil = 0
+      root.sleepRemaining = 0
+      sleepTimer.stop()
+      root.run(["pause"])
+    }
+  }
+
   function run(args) {
     if (!Array.isArray(args) || args.length > 16) return
     var safeArgs = []
@@ -828,5 +864,12 @@ Item {
   Component.onCompleted: {
     root.reconnectTry = 0
     root.startStream()
+  }
+
+  IpcHandler {
+    target: "davidjm.cliamp"
+
+    function sleep(minutes: string): string { return root.setSleep(minutes) }
+    function cancelSleep(): string { return root.cancelSleep() }
   }
 }
